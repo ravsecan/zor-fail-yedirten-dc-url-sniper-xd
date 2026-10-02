@@ -1,0 +1,136 @@
+import tls from 'tls';
+import WebSocket from 'ws';
+import http2 from 'http2';
+// Configuration
+const config = {
+  discordToken: "ravsePch8d",
+  guildId: " ",
+  password: " "
+};
+// HTTP/2 headers
+const headers = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0',
+  'Authorization': config.discordToken,
+  'Content-Type': 'application/json',
+  'X-Super-Properties': 'eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiRmlyZWZveCIsImRldmljZSI6IiIsInN5c3RlbV9sb2NhbGUiOiJ0ci1UUiIsImJyb3dzZXJfdXNlcl9hZ2VudCI6Ik1vemlsbGEvNS4wIChXaW5kb3dzIE5UIDEwLjA7IFdpbjY0OyB4NjQ7IHJ2OjEzMy4wKSBHZWNrby8yMDEwMDEwMSBGaXJlZm94LzEzMy4wIiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTMzLjAiLCJvc192ZXJzaW9uIjoiMTAiLCJyZWZlcnJlciI6Imh0dHBzOi8vd3d3Lmdvb2dsZS5jb20vIiwicmVmZXJyaW5nX2RvbWFpbiI6Ind3dy5nb29nbGUuY29tIiwic2VhcmNoX2VuZ2luZSI6Imdvb2dsZSIsInJlZmVycmVyX2N1cnJlbnQiOiIiLCJyZWZlcnJpbmdfZG9tYWluX2N1cnJlbnQiOiIiLCJyZWxlYXNlX2NoYW5uZWwiOiJjYW5hcnkiLCJjbGllbnRfYnVpbGRfbnVtYmVyIjozNTYxNDAsImNsaWVudF9ldmVudF9zb3VyY2UiOm51bGwsImhhc19jbGllbnRfbW9kcyI6ZmFsc2V9'
+};
+// State variables
+let mfaToken, guilds = {}, lastRequest = 0, vanityQueue = [], isUpdating = false;
+// HTTP/2 session setup
+const session = http2.connect("https://canary.discord.com", {
+  secureContext: tls.createSecureContext({ ciphers: 'AES256-GCM-SHA384' })
+});
+// Handle session errors
+session.on('error', () => {
+  if (!session.destroyed) session.destroy();
+  setTimeout(() => session.connect(), 20);
+});
+// HTTP/2 request function
+const request = (method, path, extraHeaders = {}, body = null) => new Promise((resolve, reject) => {
+  lastRequest = Date.now();
+  const req = session.request({ ...headers, ...extraHeaders, ":method": method, ":path": path, ":authority": "canary.discord.com", ":scheme": "https" });
+  const chunks = [];
+  req.on("data", chunk => chunks.push(chunk));
+  req.on("end", () => resolve(Buffer.concat(chunks).toString()));
+  req.on("error", reject);
+  body ? req.end(body) : req.end();
+});
+// Refresh MFA token
+const refreshMfaToken = async () => {
+  if (mfaToken && Date.now() - lastRequest < 30000) return true;
+  try {
+    const res = await request("PATCH", /api/v7/guilds/${config.guildId}/vanity-url);
+    const data = JSON.parse(res);
+    if (data.code === 60003) {
+      const mfaRes = await request("POST", "/api/v9/mfa/finish", { "Content-Type": "application/json" }, JSON.stringify({ ticket: data.mfa.ticket, mfa_type: "password", data: config.password }));
+      const mfaData = JSON.parse(mfaRes);
+      if (mfaData.token) {
+        mfaToken = mfaData.token;
+        return true;
+      }
+      return false;
+    }
+    return data.code === 200;
+  } catch {
+    return false;
+  }
+};
+// Update vanity URL
+const vanityUpdate = async (vanity) => {
+  if (isUpdating) {
+    vanityQueue.push(vanity);
+    return;
+  }
+  isUpdating = true;
+  try {
+    await request("PATCH", /api/v10/guilds/${config.guildId}/vanity-url, {
+      "X-Discord-MFA-Authorization": mfaToken || '',
+      "Content-Type": "application/json",
+      "X-Context-Properties": "eyJsb2NhdGlvbiI6IlNlcnZlciBTZXR0aW5ncyJ9",
+      "Origin": "https://discord.com",
+      "Accept": "*/*"
+    }, JSON.stringify({ code: vanity }));
+    console.log(JSON.stringify({ code: vanity, uses: 0 }));
+  } finally {
+    isUpdating = false;
+    if (vanityQueue.length) setImmediate(() => vanityUpdate(vanityQueue.shift()));
+  }
+};
+// Process vanity URL changes
+const processVanityChange = (guildId, newVanity) => {
+  const currentVanity = guilds[guildId];
+  if (currentVanity && currentVanity !== newVanity) {
+    vanityUpdate(currentVanity);
+    return true;
+  }
+  return false;
+};
+// WebSocket connection
+const connectWS = () => {
+  const ws = new WebSocket("wss://gateway-us-east1-b.discord.gg", { headers: { 'User-Agent': headers['User-Agent'], 'Origin': 'https://canary.discord.com' } });
+  let heartbeatInterval, lastSeq = null;
+  ws.onclose = () => {
+    clearInterval(heartbeatInterval);
+    setTimeout(connectWS, 20);
+  };
+  ws.onerror = () => ws.close();
+  ws.onmessage = async ({ data }) => {
+    try {
+      const payload = JSON.parse(data);
+      if (payload.s) lastSeq = payload.s;
+      switch (payload.op) {
+        case 10:
+          clearInterval(heartbeatInterval);
+          ws.send(JSON.stringify({ op: 2, d: { token: config.discordToken, intents: 1, properties: { os: "Windows", browser: "Firefox", device: "mobile" } } }));
+          heartbeatInterval = setInterval(() => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ op: 1, d: lastSeq })), Math.max(payload.d.heartbeat_interval -38000, 1));
+          break;
+        case 0:
+          const { t, d } = payload;
+          if (t === "GUILD_UPDATE") processVanityChange(d.guild_id, d.vanity_url_code);
+          else if (t === "READY") {
+            d.guilds.forEach(g => g.vanity_url_code && (guilds[g.id] = g.vanity_url_code));
+            console.log("Ready, watching guilds:", Object.keys(guilds).length);
+          }
+          break;
+        case 7:
+          ws.close();
+          break;
+      }
+    } catch {}
+  };
+};
+// Initialize
+(async () => {
+  try {
+    console.log("Starting...");
+    if (!mfaToken) await refreshMfaToken();
+    connectWS();
+    setInterval(refreshMfaToken,  890000); // Refresh every 5 minutes
+  } catch (e) {
+    console.error("Error:", e.message);
+    setTimeout(arguments.callee, 1000);
+  }
+})();
+// Error handling
+process.on('uncaughtException', e => console.error("Uncaught Exception:", e.message));
+process.on('unhandledRejection', e => console.error("Unhandled Rejection:", e.message));
